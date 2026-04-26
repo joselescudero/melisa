@@ -1,0 +1,206 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Excel Processor</title>
+    <link rel="stylesheet" href="/01-general/shared.css">
+    <style>
+        body {
+            padding: 20px;
+            display: flex;
+            flex-direction: column;
+            gap: 16px;
+        }
+
+        h1 {
+            font-size: 1.1rem;
+            color: var(--header-bg);
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+
+        .placeholder {
+            text-align: center;
+            color: #aaa;
+            font-style: italic;
+            padding: 60px 20px;
+        }
+
+        .row-info {
+            background: #fff;
+            border-radius: 8px;
+            padding: 16px 20px;
+            box-shadow: 0 1px 3px rgba(0,0,0,.08);
+        }
+        .row-info h2 {
+            font-size: .95rem;
+            margin-bottom: 10px;
+            color: #555;
+        }
+        .row-info ul { list-style: none; line-height: 1.8; font-size: .9rem; }
+        .row-info strong { color: var(--header-bg); }
+
+        .auto-result {
+            background: #e8f4ed;
+            border: 1px solid var(--header-bg);
+            border-radius: 8px;
+            padding: 16px 20px;
+            text-align: center;
+        }
+        .auto-result .label {
+            font-size: .8rem;
+            color: #555;
+            text-transform: uppercase;
+            letter-spacing: .5px;
+            margin-bottom: 6px;
+        }
+        .auto-result .value {
+            font-size: 1.8rem;
+            font-weight: 700;
+            color: var(--header-bg);
+        }
+        .auto-result .formula {
+            font-size: .75rem;
+            color: #888;
+            margin-top: 6px;
+        }
+
+        .buttons-section {
+            background: #fff;
+            border-radius: 8px;
+            padding: 16px 20px;
+            box-shadow: 0 1px 3px rgba(0,0,0,.08);
+        }
+        .buttons-section h2 {
+            font-size: .9rem;
+            color: #555;
+            margin-bottom: 12px;
+        }
+        .button-grid {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 8px;
+        }
+
+        #status-banner {
+            text-align: center;
+            font-size: .8rem;
+            padding: 6px;
+            border-radius: 4px;
+            background: #f0f2f5;
+            color: #666;
+        }
+        #status-banner.connected { background: #e8f5e9; color: #2e7d32; }
+    </style>
+</head>
+<body>
+
+<h1>&#9881; Excel Processor</h1>
+<div id="status-banner">Waiting for table tab…</div>
+
+<div id="content">
+    <div class="placeholder">Select a row from the table tab to start processing</div>
+</div>
+
+<script>
+    const channel = new BroadcastChannel("excel-processor");
+    let currentRow = null;     // { rowIndex, headers, row }
+
+    // Tell the table tab we're alive
+    channel.postMessage({ type: "processor-ready" });
+    document.getElementById("status-banner").textContent = "Connected to table tab";
+    document.getElementById("status-banner").classList.add("connected");
+
+    channel.addEventListener("message", (ev) => {
+        const msg = ev.data;
+        if (msg.type === "row-selected") {
+            currentRow = msg;
+            renderRow();
+        } else if (msg.type === "table-closed") {
+            document.getElementById("status-banner").textContent = "Table tab closed";
+            document.getElementById("status-banner").classList.remove("connected");
+        }
+    });
+
+    // Notify table tab when this window closes
+    window.addEventListener("beforeunload", () => {
+        channel.postMessage({ type: "processor-closed" });
+    });
+
+    function escapeHtml(str) {
+        const div = document.createElement("div");
+        div.appendChild(document.createTextNode(str));
+        return div.innerHTML;
+    }
+
+    // ============================================================
+    // Render a row: information + auto-computed value + per-column buttons
+    // ============================================================
+    function renderRow() {
+        const { rowIndex, headers, row } = currentRow;
+
+        // Row info — list every column with its title (header) and value
+        const infoLines = headers
+            .map((h, i) => {
+                const v = row[i];
+                if (v === null || v === undefined || v === "") return null;
+                return `<li><strong>${escapeHtml(String(h))}</strong> = ${escapeHtml(String(v))}</li>`;
+            })
+            .filter(Boolean)
+            .join("");
+
+        // Auto-computed value: sum of the string lengths of all column values
+        const autoValue = row.reduce((sum, v) => {
+            return sum + (v === null || v === undefined ? 0 : String(v).length);
+        }, 0);
+
+        // One button per column: clicking it returns that column's value
+        const buttons = headers
+            .map((h, i) => {
+                const v = row[i];
+                const display = v === null || v === undefined || v === "" ? "(empty)" : String(v);
+                return `<button class="btn-col" data-col="${i}" title="${escapeHtml(display)}">${escapeHtml(String(h))}</button>`;
+            })
+            .join("");
+
+        document.getElementById("content").innerHTML = `
+            <div class="row-info">
+                <h2>Row ${rowIndex + 1} — selected data</h2>
+                <ul>${infoLines}</ul>
+            </div>
+
+            <div class="auto-result">
+                <div class="label">Auto-computed result (saved to Excel)</div>
+                <div class="value">${autoValue}</div>
+                <div class="formula">= sum of length(value) for each column</div>
+            </div>
+
+            <div class="buttons-section">
+                <h2>Or override by sending a specific column value:</h2>
+                <div class="button-grid">${buttons}</div>
+            </div>
+        `;
+
+        // Auto-send the computed value immediately
+        sendAnswer(rowIndex, String(autoValue));
+
+        // Wire up column buttons — clicking one overrides the saved value
+        document.querySelectorAll(".btn-col").forEach((btn) => {
+            btn.addEventListener("click", () => {
+                const colIdx = parseInt(btn.dataset.col, 10);
+                const value = row[colIdx];
+                const stringValue = value === null || value === undefined ? "" : String(value);
+                sendAnswer(rowIndex, stringValue);
+                btn.style.background = "var(--btn-yes)";
+                setTimeout(() => { btn.style.background = ""; }, 800);
+            });
+        });
+    }
+
+    function sendAnswer(rowIndex, value) {
+        channel.postMessage({ type: "answer", rowIndex, value });
+    }
+</script>
+</body>
+</html>

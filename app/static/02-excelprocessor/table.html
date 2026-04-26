@@ -1,0 +1,411 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Excel Table</title>
+    <link rel="stylesheet" href="/01-general/shared.css">
+    <script src="https://alcdn.msauth.net/browser/2.38.3/js/msal-browser.min.js"></script>
+    <style>
+        main {
+            max-width: 1400px;
+            margin: 16px auto;
+            padding: 0 16px;
+        }
+
+        #table-container { overflow-x: auto; }
+
+        table { width: 100%; border-collapse: collapse; font-size: .85rem; }
+
+        /* ── Header row ── */
+        thead tr:first-child th {
+            background: var(--header-bg);
+            color: var(--header-text);
+            padding: 10px 14px;
+            text-align: left;
+            font-weight: 600;
+            white-space: nowrap;
+            border-right: 1px solid rgba(255,255,255,.2);
+        }
+        thead tr:first-child th:last-child { border-right: none; }
+
+        th.row-num { background: #5a5a5a !important; color: #fff; border-right: 2px solid rgba(255,255,255,.2) !important; }
+
+        /* ── Filter row ── */
+        #filter-row td {
+            background: #dde3ea;
+            padding: 4px 6px;
+            border-bottom: 2px solid #aab;
+        }
+        #filter-row select {
+            width: 100%;
+            font-size: .78rem;
+            border: 1px solid #bbb;
+            border-radius: 3px;
+            padding: 2px 4px;
+            background: #fff;
+            cursor: pointer;
+            min-width: 70px;
+        }
+        #filter-row select.active-filter {
+            border-color: var(--header-bg);
+            background: #e8f4ed;
+            font-weight: 600;
+        }
+
+        /* ── Data rows ── */
+        td {
+            padding: 8px 14px;
+            border-bottom: 1px solid var(--border);
+            border-right: 1px solid #eee;
+            white-space: nowrap;
+        }
+        td:last-child { border-right: none; }
+        tr:nth-child(even) { background: var(--row-alt); }
+        tr:hover { background: var(--row-hover); }
+
+        .row-num {
+            background: #f0f0f0;
+            color: #888;
+            text-align: center;
+            font-size: .8rem;
+            width: 40px;
+            border-right: 2px solid var(--border);
+        }
+
+        /* ── Process All button (lives in th) ── */
+        #process-all-btn {
+            font-size: .8rem;
+            padding: 5px 12px;
+            white-space: nowrap;
+        }
+
+        #no-results {
+            text-align: center;
+            color: #999;
+            font-style: italic;
+            padding: 32px;
+        }
+    </style>
+</head>
+<body>
+
+<main>
+    <div id="table-container">
+        <table id="excel-table">
+            <thead>
+                <tr>
+                    <th colspan="99" style="text-align:center;padding:20px;">
+                        <span class="spinner"></span> Loading Excel data…
+                    </th>
+                </tr>
+            </thead>
+        </table>
+    </div>
+</main>
+
+<script src="/02-excelprocessor/excel-shared.js"></script>
+<script>
+    // ── State ──────────────────────────────────────────────
+    let sheetHeaders = [];
+    let sheetRows = [];
+    let lastSelectedRowIndex = null;
+    let processorConnected = false;
+
+    // columnFilters: Map<colIdx (number), filterValue (string) | null>
+    const columnFilters = new Map();
+
+    // Resolvers for processRowAndWait sequential processing
+    const pendingResolvers = new Map(); // rowIndex -> resolve fn
+
+    const RESULTADO_COL_LETTER = "E";
+    const RESULTADO_COL_INDEX  = 4;   // 0-based
+    const TITLE_ROW            = 1;   // headers are in row 1 (Excel 1-indexed)
+
+    // ── BroadcastChannel ───────────────────────────────────
+    const channel = new BroadcastChannel("excel-processor");
+
+    channel.addEventListener("message", async (ev) => {
+        const msg = ev.data;
+        if (msg.type === "processor-ready") {
+            processorConnected = true;
+            // Re-send last selected row so new processor tab can catch up
+            if (lastSelectedRowIndex !== null) sendRow(lastSelectedRowIndex);
+        } else if (msg.type === "processor-closed") {
+            processorConnected = false;
+        } else if (msg.type === "answer") {
+            await applyAnswer(msg.rowIndex, msg.value);
+            // Resolve any pending sequential-process promise
+            const resolve = pendingResolvers.get(msg.rowIndex);
+            if (resolve) {
+                pendingResolvers.delete(msg.rowIndex);
+                resolve();
+            }
+        }
+    });
+
+    // Open processor tab lazily on first user action (avoids popup-blocker)
+    function ensureProcessorOpen() {
+        if (!processorConnected) {
+            window.open(
+                "/02-excelprocessor/processor.html",
+                "excel-processor-tab",
+                "popup=yes,width=720,height=620"
+            );
+        }
+    }
+
+    function sendRow(rowIndex) {
+        channel.postMessage({
+            type: "row-selected",
+            rowIndex,
+            headers: sheetHeaders,
+            row: sheetRows[rowIndex],
+        });
+    }
+
+    // ── Init ───────────────────────────────────────────────
+    (async () => {
+        try {
+            await ExcelApp.init();
+            await loadData();
+        } catch (e) {
+            renderError("Error: " + e.message);
+            ExcelApp.showToast(e.message, "error");
+        }
+    })();
+
+    // ── Data loading ───────────────────────────────────────
+    async function loadData() {
+        const data = await ExcelApp.readSheet();
+        sheetHeaders = data.headers;
+        sheetRows    = data.rows;
+        renderTable();
+    }
+
+    function renderError(msg) {
+        document.getElementById("excel-table").innerHTML =
+            `<thead><tr><th colspan="99" style="text-align:center;padding:20px;color:#c44">${msg}</th></tr></thead>`;
+    }
+
+    // ── Filtering ──────────────────────────────────────────
+    function getVisibleRows() {
+        return sheetRows
+            .map((row, idx) => ({ row, idx }))
+            .filter(({ row }) => {
+                for (const [colIdx, filterVal] of columnFilters.entries()) {
+                    if (!filterVal) continue;
+                    if (String(row[colIdx] ?? "") !== filterVal) return false;
+                }
+                return true;
+            });
+    }
+
+    // ── Full table render (thead + tbody) ──────────────────
+    function renderTable() {
+        const table = document.getElementById("excel-table");
+        table.innerHTML = "";
+
+        const thead = document.createElement("thead");
+
+        // Header row
+        const headerRow = document.createElement("tr");
+        const numTh = document.createElement("th");
+        numTh.className = "row-num";
+        numTh.textContent = "#";
+        headerRow.appendChild(numTh);
+
+        sheetHeaders.forEach((h) => {
+            const th = document.createElement("th");
+            th.textContent = h;
+            headerRow.appendChild(th);
+        });
+
+        // "Process All" button in the Action column header
+        const thAction = document.createElement("th");
+        thAction.style.textAlign = "center";
+        const processAllBtn = document.createElement("button");
+        processAllBtn.id = "process-all-btn";
+        processAllBtn.className = "btn-action";
+        processAllBtn.textContent = `⚡ Process All (${getVisibleRows().length})`;
+        processAllBtn.addEventListener("click", processAllVisible);
+        thAction.appendChild(processAllBtn);
+        headerRow.appendChild(thAction);
+        thead.appendChild(headerRow);
+
+        // Filter row
+        const filterRow = document.createElement("tr");
+        filterRow.id = "filter-row";
+
+        // Empty cell for row-number column
+        filterRow.appendChild(document.createElement("td"));
+
+        sheetHeaders.forEach((_, colIdx) => {
+            const td = document.createElement("td");
+
+            const uniqueVals = [
+                ...new Set(sheetRows.map(r => String(r[colIdx] ?? "")))
+            ]
+                .filter(v => v !== "")
+                .sort((a, b) => a.localeCompare(b, undefined, { numeric: true }));
+
+            const sel = document.createElement("select");
+
+            const optAll = document.createElement("option");
+            optAll.value = "";
+            optAll.textContent = "— All —";
+            sel.appendChild(optAll);
+
+            uniqueVals.forEach(v => {
+                const opt = document.createElement("option");
+                opt.value = v;
+                opt.textContent = v;
+                sel.appendChild(opt);
+            });
+
+            // Restore previously active filter
+            const current = columnFilters.get(colIdx);
+            if (current) {
+                sel.value = current;
+                sel.classList.add("active-filter");
+            }
+
+            sel.addEventListener("change", () => {
+                const val = sel.value || null;
+                columnFilters.set(colIdx, val);
+                sel.classList.toggle("active-filter", !!val);
+                renderTableBody();
+                updateProcessAllCount();
+            });
+
+            td.appendChild(sel);
+            filterRow.appendChild(td);
+        });
+
+        // Empty cell for action column
+        filterRow.appendChild(document.createElement("td"));
+        thead.appendChild(filterRow);
+
+        table.appendChild(thead);
+        renderTableBody(table);
+    }
+
+    // ── tbody-only render (preserves filters) ─────────────
+    function renderTableBody(tableEl) {
+        const table = tableEl || document.getElementById("excel-table");
+
+        const existing = table.querySelector("tbody");
+        if (existing) existing.remove();
+
+        const tbody = document.createElement("tbody");
+        const visible = getVisibleRows();
+
+        if (visible.length === 0) {
+            const tr = document.createElement("tr");
+            const td = document.createElement("td");
+            td.colSpan = sheetHeaders.length + 2;
+            td.id = "no-results";
+            td.textContent = "No rows match the current filters.";
+            tr.appendChild(td);
+            tbody.appendChild(tr);
+        } else {
+            visible.forEach(({ row, idx }) => {
+                const tr = document.createElement("tr");
+
+                const numTd = document.createElement("td");
+                numTd.className = "row-num";
+                numTd.textContent = idx + 1;
+                tr.appendChild(numTd);
+
+                row.forEach((cell) => {
+                    const td = document.createElement("td");
+                    td.textContent = cell ?? "";
+                    tr.appendChild(td);
+                });
+
+                const tdBtn = document.createElement("td");
+                tdBtn.style.textAlign = "center";
+                const btn = document.createElement("button");
+                btn.className = "btn-action";
+                btn.textContent = "Process";
+                btn.addEventListener("click", () => selectRow(idx));
+                tdBtn.appendChild(btn);
+                tr.appendChild(tdBtn);
+
+                tbody.appendChild(tr);
+            });
+        }
+
+        table.appendChild(tbody);
+    }
+
+    function updateProcessAllCount() {
+        const btn = document.getElementById("process-all-btn");
+        if (btn) btn.textContent = `⚡ Process All (${getVisibleRows().length})`;
+    }
+
+    // ── Row selection ──────────────────────────────────────
+    function selectRow(rowIndex) {
+        ensureProcessorOpen();
+        lastSelectedRowIndex = rowIndex;
+        sendRow(rowIndex);
+        ExcelApp.showToast(`Row ${rowIndex + 1} sent to processor`, "info");
+    }
+
+    // ── Apply answer from processor ────────────────────────
+    async function applyAnswer(rowIndex, value) {
+        const cellAddress = `${RESULTADO_COL_LETTER}${rowIndex + TITLE_ROW + 1}`;
+        try {
+            await ExcelApp.updateCell(cellAddress, value);
+            sheetRows[rowIndex][RESULTADO_COL_INDEX] = value;
+            renderTableBody();
+            ExcelApp.showToast(`Cell ${cellAddress} = "${value}"`, "success");
+        } catch (e) {
+            ExcelApp.showToast("Failed to save: " + e.message, "error");
+        }
+    }
+
+    // ── Process All visible rows sequentially ──────────────
+    async function processAllVisible() {
+        const visible = getVisibleRows();
+        if (visible.length === 0) {
+            ExcelApp.showToast("No visible rows to process", "info");
+            return;
+        }
+
+        if (!confirm(`You are about to process ${visible.length} row${visible.length > 1 ? "s" : ""}. Are you sure?`)) return;
+
+        ensureProcessorOpen();
+
+        // If processor just opened, give it a moment to connect
+        if (!processorConnected) {
+            await new Promise(r => setTimeout(r, 900));
+        }
+
+        const btn = document.getElementById("process-all-btn");
+        if (btn) { btn.disabled = true; btn.textContent = "Processing…"; }
+
+        for (const { idx } of visible) {
+            await processRowAndWait(idx);
+        }
+
+        if (btn) {
+            btn.disabled = false;
+            updateProcessAllCount();
+        }
+        ExcelApp.showToast(`✅ Processed ${visible.length} row${visible.length > 1 ? "s" : ""}`, "success");
+    }
+
+    // Send a row and resolve only after the answer has been applied
+    function processRowAndWait(rowIndex) {
+        return new Promise((resolve) => {
+            pendingResolvers.set(rowIndex, resolve);
+            sendRow(rowIndex);
+        });
+    }
+
+    window.addEventListener("beforeunload", () => {
+        channel.postMessage({ type: "table-closed" });
+    });
+</script>
+</body>
+</html>
